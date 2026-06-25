@@ -1,13 +1,17 @@
 from refactx.index import load_index, populate_postgres_index
 from refactx.prompt_base import PROMPT_TEMPLATE
 
-def apply_prompt_template(tokenizer, prompt_template=PROMPT_TEMPLATE, question=None):
+def apply_prompt_template(tokenizer, prompt_template=PROMPT_TEMPLATE, question=None, **chat_template_kwargs):
+    # Extra kwargs are forwarded to ``apply_chat_template`` (e.g.
+    # ``enable_thinking=False`` for Qwen3-style thinking models, whose <think>
+    # ramble otherwise breaks the ReFactX `Fact:` protocol). Templates that do
+    # not use a given kwarg simply ignore it.
     if question is None:
         # only prompt for caching
-        return tokenizer.apply_chat_template(prompt_template, tokenize=False, add_generation_prompt=False)
+        return tokenizer.apply_chat_template(prompt_template, tokenize=False, add_generation_prompt=False, **chat_template_kwargs)
     else:
         question_w_role = {'role':'user', 'content': question}
-        return tokenizer.apply_chat_template(prompt_template + [question_w_role], tokenize=False, add_generation_prompt=True)
+        return tokenizer.apply_chat_template(prompt_template + [question_w_role], tokenize=False, add_generation_prompt=True, **chat_template_kwargs)
 
 def get_constrained_logits_processor(tokenizer, index, num_beams=1, num_batches=1, return_list=False):
     from refactx.generate import get_constrained_logits_processor as _base
