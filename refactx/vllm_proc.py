@@ -128,8 +128,12 @@ class RefactxLogitsProcessor(LogitsProcessor):
         # Reuse the HF masking + duplicate-avoidance logic unchanged. ``states``
         # is unused inside ``constrained_generation`` (state is passed per call),
         # so ``None`` is fine.
+        # Opt-in decode-time sentinel: when a subject-relation is exhausted, keep
+        # it selectable and emit a "no further records" object instead of pruning
+        # the relation (which forces the model to enumerate other relations).
+        sentinel = os.environ.get("REFACTX_SENTINEL", "").lower() in ("1", "true", "yes")
         self._cgen = ConstrainedLogitsProcessor(
-            index=self.index, states=None, tokenizer=self.tokenizer
+            index=self.index, states=None, tokenizer=self.tokenizer, sentinel=sentinel
         )
 
         # Active constrained requests, keyed by persistent-batch row index.

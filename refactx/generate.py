@@ -187,6 +187,10 @@ class PatternConstrainedState():
 
         self.subtree_cache = subtree_cache
 
+        # Decode-time sentinel: token ids still to be emitted for a
+        # "no further records" object once a subject-relation is exhausted.
+        self.sentinel_remaining = []
+
         self._first_call = True
 
         self.debug = debug
@@ -217,6 +221,7 @@ class PatternConstrainedState():
 
     def end_of_triple_reset(self):
         self.subtree_cache.reset()
+        self.sentinel_remaining = []
         # reset to normal generation
         self.state = 0
 
@@ -279,16 +284,41 @@ class PatternConstrainedState():
         return self.cursor
 
 class ConstrainedLogitsProcessor(LogitsProcessor):
-    def __init__(self, index, states, tokenizer=None, error_strategy=0, avoid_duplicates=True):
+    def __init__(self, index, states, tokenizer=None, error_strategy=0, avoid_duplicates=True,
+                 sentinel=False, sentinel_text='no further records>'):
         self.index = index
         self.states = states
         self.error_strategy = error_strategy
         self.avoid_duplicates = avoid_duplicates
 
+        # When ``sentinel`` is on, an exhausted subject-relation is not pruned
+        # from the trie (which would force the model onto a different relation).
+        # Instead the relation stays selectable and its object slot yields a
+        # fixed "no further records" object, so the model gets an explicit
+        # "nothing more here" signal. ``sentinel_text`` is the object value
+        # (without the leading ``<``, which the model emits as the object opener).
+        self.sentinel = sentinel
+        self.sentinel_text = sentinel_text
+        self._sentinel_ids_cache = None
+
         self.ERROR_STRATEGY_WARN = 0
         self.ERROR_STRATEGY_FAIL = 1
 
         self.tokenizer=tokenizer # for debugging
+
+    def _sentinel_ids(self):
+        if self._sentinel_ids_cache is None:
+            self._sentinel_ids_cache = self.tokenizer.encode(
+                self.sentinel_text, add_special_tokens=False)
+        return self._sentinel_ids_cache
+
+    def _begin_sentinel(self, state, mask, mask_idx):
+        ids = self._sentinel_ids()
+        mask[mask_idx, :] = -math.inf
+        mask[mask_idx, ids[0]] = 0
+        state.sentinel_remaining = list(ids[1:])
+        if not state.sentinel_remaining:
+            state.end_of_triple_reset()
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor):
         assert input_ids.shape[0] == len(self.states), \
@@ -325,33 +355,76 @@ class ConstrainedLogitsProcessor(LogitsProcessor):
         return scores_processed
 
     def constrained_generation(self, sequence, mask: torch.FloatTensor, mask_idx, state):
+        # Mid-sentinel: keep emitting the "no further records" object token by token.
+        if state.sentinel_remaining:
+            nxt = state.sentinel_remaining.pop(0)
+            mask[mask_idx, :] = -math.inf
+            mask[mask_idx, nxt] = 0
+            if not state.sentinel_remaining:
+                state.end_of_triple_reset()
+            return
 
         possible_tokens, _ = self.index.next_tokens(sequence, state = state)
+
+        if not self.sentinel:
+            # ---- original behaviour: prune exhausted branches ----
+            if self.avoid_duplicates:
+                try:
+                    visited_tokens, _ = state.cache_index.next_tokens(sequence)
+                    state.cache_index.subtract_tokens(possible_tokens, visited_tokens)
+                except EmptyIndexException:
+                    pass
+                except TripleNotFoundException:
+                    pass
+
+            keys = list(possible_tokens.keys())
+            if len(keys) == 0:
+                state.cache_add(sequence)
+                state.end_of_triple_reset()
+                mask[mask_idx, :] = 0
+            else:
+                mask[mask_idx, keys] = 0
+            return
+
+        # ---- sentinel-enabled behaviour ----
+        # Split continuations into `live` (new leaves remain) and `exhausted`
+        # (every leaf already generated) instead of deleting the exhausted ones.
+        live = dict(possible_tokens)
+        exhausted = {}
         if self.avoid_duplicates:
             try:
                 visited_tokens, _ = state.cache_index.next_tokens(sequence)
-                # print(visited_tokens, end=' = ')
-                state.cache_index.subtract_tokens(possible_tokens, visited_tokens)
-                # print(possible_tokens)
+                for tok, total in list(possible_tokens.items()):
+                    if total - visited_tokens.get(tok, 0) <= 0:
+                        exhausted[tok] = total
+                        del live[tok]
             except EmptyIndexException:
-                # ignore when the cache index is empty
                 pass
             except TripleNotFoundException:
-                # ignore if triple not in cache index
                 pass
 
-        possible_tokens = list(possible_tokens.keys()) # TODO transform subtract tokens in a prob modifier
-
         if len(possible_tokens) == 0:
-            # end of constrained generation
-            # send end of string
-            generated_triple = sequence
-            state.cache_add(generated_triple)
-            # ensure to reset after eof triple
+            # Genuine end of a real triple in the trie.
+            state.cache_add(sequence)
             state.end_of_triple_reset()
-            # end of constrained generation
             mask[mask_idx, :] = 0
+            return
+
+        # Object slot starts after the second "> <" of "<S> <R> <O>".
+        in_object = (self.tokenizer or state.tokenizer).decode(sequence).count('> <') >= 2
+        live_keys = list(live.keys())
+
+        if in_object:
+            if live_keys:
+                # New object value(s) still available: emit them normally.
+                mask[mask_idx, live_keys] = 0
+            else:
+                # Object fully visited -> emit the sentinel instead of forcing a
+                # duplicate (object exhausted) or rerouting.
+                self._begin_sentinel(state, mask, mask_idx)
         else:
-            mask[mask_idx, possible_tokens] = 0
+            # Subject / relation: keep exhausted branches selectable so the model
+            # is not forced off the relation it wants.
+            mask[mask_idx, live_keys + list(exhausted.keys())] = 0
 
 CONSTRAINED_STATES = ConstrainedStateList([])
